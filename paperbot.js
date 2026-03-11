@@ -776,6 +776,13 @@ async function main() {
         setTimeout(() => { dailySummary(); schedDaily() }, next.getTime() - Date.now())
     }
     schedDaily()
+
+    // ⑧ Start dummy HTTP server for Render Free Tier (Web Service)
+    const express = require('express')
+    const app = express()
+    app.get('/', (req, res) => res.send('0x8dxd Paper Bot is running!'))
+    const port = process.env.PORT || 3000
+    app.listen(port, () => console.log(`  🌐 Dummy web server listening on port ${port} (for Render Free Tier)`))
 }
 
 main().catch(e => { console.error(e); process.exit(1) })
