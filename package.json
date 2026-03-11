@@ -1,0 +1,22 @@
+{
+  "name": "polymarket2",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node bot.js",
+    "backtest": "node backtest.js",
+    "montecarlo": "node montecarlo.js",
+    "paperbot": "node paperbot.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "axios": "^1.13.6",
+    "dotenv": "^17.3.1",
+    "ethers": "^6.16.0",
+    "ws": "^8.19.0"
+  }
+}

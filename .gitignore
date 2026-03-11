@@ -1,0 +1,5 @@
+node_modules/
+.env
+paper_trades.json
+montecarlo_output.txt
+.DS_Store
