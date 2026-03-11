@@ -597,7 +597,7 @@ async function closePosition(pos, closePrice, reason) {
 
 function connectBinanceWS() {
     const streams = Object.values(ASSET_MAP).map(a => `${a.pair.toLowerCase()}@trade`).join('/')
-    const ws = new WebSocket(`wss://stream.binance.com:9443/stream?streams=${streams}`)
+    const ws = new WebSocket(`wss://data-stream.binance.vision:9443/stream?streams=${streams}`)
 
     ws.on('open', () => {
         log(`\n✅ Binance WebSocket connected — streaming ${Object.keys(ASSET_MAP).length} assets`)
@@ -743,7 +743,7 @@ async function main() {
     log('\n  Fetching initial Binance prices...')
     for (const [asset, cfg] of Object.entries(ASSET_MAP)) {
         try {
-            const r = await axios.get('https://api.binance.com/api/v3/ticker/price', {
+            const r = await axios.get('https://data-api.binance.vision/api/v3/ticker/price', {
                 params: { symbol: cfg.pair }, timeout: 5000,
             })
             binancePrices[asset] = parseFloat(r.data.price)
