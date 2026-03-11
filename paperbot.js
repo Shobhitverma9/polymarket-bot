@@ -777,12 +777,47 @@ async function main() {
     }
     schedDaily()
 
-    // ⑧ Start dummy HTTP server for Render Free Tier (Web Service)
+    // ⑧ Start HTTP server for Render Free Tier (Web Service) + Live Results Dashboard
     const express = require('express')
     const app = express()
-    app.get('/', (req, res) => res.send('0x8dxd Paper Bot is running!'))
+    
+    app.get('/', (req, res) => {
+        const pnl     = portfolio.capital - portfolio.start
+        const pnlPct  = ((portfolio.capital / portfolio.start - 1) * 100).toFixed(2)
+        const wins    = portfolio.closedTrades.filter(t => t.won).length
+        const losses  = portfolio.closedTrades.filter(t => !t.won).length
+        const wr      = (wins + losses) > 0 ? (wins / (wins + losses) * 100).toFixed(0) : 0
+        
+        res.json({
+            status: "Online",
+            mode: CONFIG.PAPER_TRADING ? "PAPER_TRADING" : "LIVE",
+            runtime_hours: Math.floor((Date.now() - portfolio.sessionStart.getTime()) / 3_600_000),
+            scans_completed: scanCount,
+            signals_found: totalSignals,
+            capital: {
+                starting: portfolio.start,
+                current: parseFloat(portfolio.capital.toFixed(4)),
+                pnl_dollars: parseFloat(pnl.toFixed(4)),
+                pnl_percent: parseFloat(pnlPct)
+            },
+            performance: {
+                total_trades: wins + losses,
+                wins: wins,
+                losses: losses,
+                win_rate: `${wr}%`
+            },
+            open_positions: portfolio.openPositions.map(p => ({
+                asset: p.asset,
+                direction: p.direction,
+                entryPrice: p.entryPrice,
+                betAmt: p.betAmt,
+                lag_tier: p.tier
+            }))
+        })
+    })
+
     const port = process.env.PORT || 3000
-    app.listen(port, () => console.log(`  🌐 Dummy web server listening on port ${port} (for Render Free Tier)`))
+    app.listen(port, () => console.log(`  🌐 Live dashboard server listening on port ${port} (Render)`))
 }
 
 main().catch(e => { console.error(e); process.exit(1) })
