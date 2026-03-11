@@ -363,6 +363,10 @@ async function getCLOBPrice(tokenId) {
 async function runScan() {
     scanCount++
     const now    = Date.now()
+    
+    // Fallback: If WS is blocked (Error 451), manually fetch prices before scanning
+    await fetchRESTPrices()
+    
     const assets = Object.keys(binancePrices).filter(a => binancePrices[a] !== null)
     log(`\n⟳ Scan #${scanCount} [${new Date().toISOString().slice(11,19)}] — ${activeMarkets.length} markets | assets live: ${assets.join(',')}`)
 
@@ -615,9 +619,26 @@ function connectBinanceWS() {
             }
         } catch (_) {}
     })
-    ws.on('close', () => { log('⚠️  Binance WS disconnected — reconnecting in 5s'); setTimeout(connectBinanceWS, 5000) })
+    ws.on('close', () => { 
+        log('⚠️  Binance WS disconnected — will fallback to REST API'); 
+        setTimeout(connectBinanceWS, 15000) 
+    })
     ws.on('error', e => log(`⚠️  Binance WS error: ${e.message}`))
     return ws
+}
+
+async function fetchRESTPrices() {
+    try {
+        const r = await axios.get('https://data-api.binance.vision/api/v3/ticker/price', { timeout: 3000 })
+        const prices = r.data
+        for (const p of prices) {
+            for (const [asset, cfg] of Object.entries(ASSET_MAP)) {
+                if (cfg.pair === p.symbol) {
+                    binancePrices[asset] = parseFloat(p.price)
+                }
+            }
+        }
+    } catch (_) {}
 }
 
 // ───────────────────────────────────────────────────────────────
