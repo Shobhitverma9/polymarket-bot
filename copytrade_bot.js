@@ -381,34 +381,20 @@ function saveTrades() {
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  ⑨ ON-CHAIN LISTENER — Polygon WebSocket via ethers.js
+//  ⑨ ON-CHAIN LISTENER — HTTP eth_getLogs polling (Render-compatible)
+//  WebSockets are blocked on Render. We use a JsonRpcProvider over
+//  HTTPS and poll eth_getLogs every POLL_MS. Latency ~3-6s vs 1-2s
+//  for WS — still 5-12× faster than the REST activity API (7-37s).
 // ─────────────────────────────────────────────────────────────────
 
-const EXCHANGE_ABI = [
-    // OrderFilled(bytes32 orderHash, address indexed maker, address indexed taker,
-    //             uint256 makerAssetId, uint256 takerAssetId,
-    //             uint256 makerAmountFilled, uint256 takerAmountFilled, uint8 side)
-    `event OrderFilled(
-        bytes32 indexed orderHash,
-        address indexed maker,
-        address indexed taker,
-        uint256 makerAssetId,
-        uint256 takerAssetId,
-        uint256 makerAmountFilled,
-        uint256 takerAmountFilled,
-        uint8   side
-    )`,
-    // Also catch the simpler legacy event variant
-    `event OrderFilled(
-        address indexed maker,
-        address indexed taker,
-        uint256 amount,
-        uint256 price
-    )`,
-]
+const POLL_MS = 4_000   // poll every 4 seconds
 
-// Newer CTF Exchange event
-const CTF_ABI = [
+// OrderFilled event topic0 (keccak256 of the signature)
+// keccak256("OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint8)")
+const ORDER_FILLED_TOPIC = '0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06c0b1a3e7601234c4a3b5d9e'
+
+// We compute it dynamically to be safe
+const iface = new ethers.Interface([
     `event OrderFilled(
         bytes32 indexed orderHash,
         address indexed maker,
@@ -419,104 +405,118 @@ const CTF_ABI = [
         uint256          takerAmountFilled,
         uint8            side
     )`,
-]
+])
+const EVENT_TOPIC = iface.getEvent('OrderFilled').topicHash
 
-let provider      = null
-let wsRetryCount  = 0
-const WS_MAX_RETRY_DELAY = 60_000  // cap backoff at 60s
-
-async function connectPolygon() {
-    log('🔌 Connecting to Polygon WebSocket...')
-
-    try {
-        // ethers v6 WebSocketProvider can throw SYNCHRONOUSLY on bad WS URL
-        // or immediately-closed socket — wrap in try-catch to prevent crash
-        provider = new ethers.WebSocketProvider(process.env.RPC)
-
-        // Wait briefly for the socket to actually open (ethers v6 connects lazily)
-        await new Promise((resolve, reject) => {
-            const t = setTimeout(() => resolve(), 5000)  // 5s max wait
-            provider.websocket.on('open', () => { clearTimeout(t); resolve() })
-            provider.websocket.on('error', e => { clearTimeout(t); reject(e) })
-        })
-
-        wsRetryCount = 0   // connected — reset backoff
-        log(`✅ Polygon WebSocket open`)
-
-        // Reconnect on unexpected close
-        provider.websocket.on('close', (code) => {
-            log(`⚠️  Polygon WS closed (code ${code}) — scheduling reconnect`)
-            scheduleReconnect()
-        })
-
-        provider.on('error', e => {
-            log(`⚠️  Polygon provider error: ${e.message}`)
-        })
-
-        // ── Attach contract event listener ─────────────────────────
-        const contract    = new ethers.Contract(CONFIG.EXCHANGE_ADDR, CTF_ABI, provider)
-        const targetLower = CONFIG.TARGET_WALLET.toLowerCase()
-
-        contract.on('OrderFilled', async (
-            orderHash,
-            maker,
-            taker,
-            makerAssetId,
-            takerAssetId,
-            makerAmountFilled,
-            takerAmountFilled,
-            side,
-            event
-        ) => {
-            try {
-                if (maker.toLowerCase() !== targetLower) return
-
-                const makerAmt  = Number(makerAmountFilled) / 1e6
-                const takerAmt  = Number(takerAmountFilled) / 1e6
-                const isBuy     = Number(side) === 0
-
-                if (!isBuy) {
-                    log(`  📤 0x8dxd SELL detected — not copying exits`)
-                    return
-                }
-
-                const detectedPrice = takerAmt > 0 ? makerAmt / takerAmt : 0
-                const tokenId       = makerAssetId.toString()
-
-                log(`\n  🔔 0x8dxd ON-CHAIN BUY detected!`)
-                log(`     TokenId : ${tokenId.slice(0, 20)}...`)
-                log(`     USDC    : $${makerAmt.toFixed(4)}  |  Shares: ${takerAmt.toFixed(4)}  |  Price: ${(detectedPrice*100).toFixed(2)}¢`)
-                log(`     TxHash  : ${event.log?.transactionHash?.slice(0, 18)}...`)
-
-                copyTrade(tokenId, detectedPrice, makerAmt).catch(e =>
-                    log(`  ⚠️  copyTrade error: ${e.message}`)
-                )
-            } catch (e) {
-                log(`  ⚠️  Event parse error: ${e.message}`)
-            }
-        })
-
-        log(`✅ Listening for OrderFilled from ${CONFIG.TARGET_WALLET}`)
-        log(`   Exchange: ${CONFIG.EXCHANGE_ADDR}`)
-
-    } catch (e) {
-        log(`❌ Polygon WS connect failed: ${e.message}`)
-        scheduleReconnect()
-    }
+// Convert wss:// → https:// so we can use plain HTTPS on Render
+function rpcHttpUrl() {
+    return (process.env.RPC || '')
+        .replace(/^wss:\/\//, 'https://')
+        .replace(/^ws:\/\//, 'http://')
 }
 
-function scheduleReconnect() {
-    wsRetryCount++
-    const delay = Math.min(5_000 * wsRetryCount, WS_MAX_RETRY_DELAY)
-    log(`🔄 Reconnecting in ${delay / 1000}s (attempt ${wsRetryCount})...`)
+let httpProvider  = null
+let lastBlock     = 0
+let pollRunning   = false
 
-    // Destroy old provider if it exists
-    try { if (provider) provider.destroy() } catch (_) {}
-    provider = null
+async function startPollingListener() {
+    const url = rpcHttpUrl()
+    log(`🔌 Connecting via HTTP JSON-RPC: ${url.slice(0, 50)}...`)
 
-    setTimeout(() => {
-        connectPolygon().catch(e => log(`⚠️  Reconnect error: ${e.message}`))
-    }, delay)
+    try {
+        httpProvider = new ethers.JsonRpcProvider(url)
+        // Verify connection
+        const currentBlock = await httpProvider.getBlockNumber()
+        lastBlock = currentBlock - 2   // start 2 blocks back so we don't miss anything
+        log(`✅ HTTP provider connected. Current block: ${currentBlock}`)
+        log(`   Polling every ${POLL_MS / 1000}s for OrderFilled from ${CONFIG.TARGET_WALLET}`)
+        log(`   Event topic: ${EVENT_TOPIC.slice(0, 20)}...`)
+    } catch (e) {
+        log(`❌ HTTP provider connect failed: ${e.message}`)
+        log(`   Retrying in 15s...`)
+        setTimeout(startPollingListener, 15_000)
+        return
+    }
+
+    // Start poll loop
+    pollRunning = true
+    pollLogs()
+}
+
+async function pollLogs() {
+    if (!pollRunning) return
+
+    try {
+        const latestBlock = await httpProvider.getBlockNumber()
+
+        if (latestBlock > lastBlock) {
+            const fromBlock = lastBlock + 1
+            const toBlock   = latestBlock
+
+            // eth_getLogs for OrderFilled on the exchange contract
+            const logs = await httpProvider.getLogs({
+                address:   CONFIG.EXCHANGE_ADDR,
+                topics:    [EVENT_TOPIC],
+                fromBlock,
+                toBlock,
+            })
+
+            if (logs.length > 0) {
+                log(`  🔍 Blocks ${fromBlock}-${toBlock}: ${logs.length} OrderFilled event(s)`)
+            }
+
+            for (const rawLog of logs) {
+                try {
+                    const parsed = iface.parseLog(rawLog)
+                    if (!parsed) continue
+
+                    const maker = parsed.args[1]   // maker address
+                    if (maker.toLowerCase() !== CONFIG.TARGET_WALLET.toLowerCase()) continue
+
+                    const makerAssetId       = parsed.args[3]
+                    const makerAmountFilled  = parsed.args[5]
+                    const takerAmountFilled  = parsed.args[6]
+                    const side               = Number(parsed.args[7])
+                    const isBuy              = side === 0
+
+                    if (!isBuy) {
+                        log(`  📤 0x8dxd SELL detected (block ${rawLog.blockNumber}) — skipping`)
+                        continue
+                    }
+
+                    const makerAmt      = Number(makerAmountFilled) / 1e6
+                    const takerAmt      = Number(takerAmountFilled) / 1e6
+                    const detectedPrice = takerAmt > 0 ? makerAmt / takerAmt : 0
+                    const tokenId       = makerAssetId.toString()
+
+                    log(`\n  🔔 0x8dxd ON-CHAIN BUY (block ${rawLog.blockNumber})`)
+                    log(`     TokenId : ${tokenId.slice(0, 20)}...`)
+                    log(`     USDC    : $${makerAmt.toFixed(4)}  |  Shares: ${takerAmt.toFixed(4)}  |  Price: ${(detectedPrice*100).toFixed(2)}¢`)
+                    log(`     TxHash  : ${rawLog.transactionHash?.slice(0, 18)}...`)
+
+                    copyTrade(tokenId, detectedPrice, makerAmt).catch(e =>
+                        log(`  ⚠️  copyTrade error: ${e.message}`)
+                    )
+                } catch (parseErr) {
+                    log(`  ⚠️  Log parse error: ${parseErr.message}`)
+                }
+            }
+
+            lastBlock = toBlock
+        }
+    } catch (e) {
+        log(`  ⚠️  Poll error: ${e.message} — will retry`)
+        // If provider is broken, recreate it
+        if (e.message?.includes('network') || e.message?.includes('connect')) {
+            pollRunning = false
+            log('  🔄 Recreating HTTP provider in 10s...')
+            setTimeout(startPollingListener, 10_000)
+            return
+        }
+    }
+
+    // Schedule next poll
+    setTimeout(pollLogs, POLL_MS)
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -564,8 +564,8 @@ async function main() {
     console.log(`  Min time left : ${CONFIG.MIN_TIME_LEFT_MS/1000}s — don't copy stale markets`)
     console.log(`  Log file      : copytrade_trades.json\n`)
 
-    // ① Connect to Polygon (async — retries on failure, never crashes process)
-    await connectPolygon()
+    // ① Start HTTP eth_getLogs polling listener (Render-compatible, no WebSocket)
+    await startPollingListener()
 
     // ② Position monitor loop
     log('\n  Bot live — waiting for 0x8dxd trades on-chain...\n')
