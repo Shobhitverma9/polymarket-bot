@@ -421,72 +421,102 @@ const CTF_ABI = [
     )`,
 ]
 
-let provider = null
+let provider      = null
+let wsRetryCount  = 0
+const WS_MAX_RETRY_DELAY = 60_000  // cap backoff at 60s
 
-function connectPolygon() {
+async function connectPolygon() {
     log('🔌 Connecting to Polygon WebSocket...')
 
-    provider = new ethers.WebSocketProvider(process.env.RPC)
+    try {
+        // ethers v6 WebSocketProvider can throw SYNCHRONOUSLY on bad WS URL
+        // or immediately-closed socket — wrap in try-catch to prevent crash
+        provider = new ethers.WebSocketProvider(process.env.RPC)
 
-    provider.on('error', e => {
-        log(`⚠️  Polygon WS error: ${e.message} — reconnecting in 15s`)
-        setTimeout(connectPolygon, 15_000)
-    })
+        // Wait briefly for the socket to actually open (ethers v6 connects lazily)
+        await new Promise((resolve, reject) => {
+            const t = setTimeout(() => resolve(), 5000)  // 5s max wait
+            provider.websocket.on('open', () => { clearTimeout(t); resolve() })
+            provider.websocket.on('error', e => { clearTimeout(t); reject(e) })
+        })
 
-    // Attach contract listener
-    const contract = new ethers.Contract(CONFIG.EXCHANGE_ADDR, CTF_ABI, provider)
+        wsRetryCount = 0   // connected — reset backoff
+        log(`✅ Polygon WebSocket open`)
 
-    // Filter: only events where maker == 0x8dxd
-    const targetLower = CONFIG.TARGET_WALLET.toLowerCase()
+        // Reconnect on unexpected close
+        provider.websocket.on('close', (code) => {
+            log(`⚠️  Polygon WS closed (code ${code}) — scheduling reconnect`)
+            scheduleReconnect()
+        })
 
-    contract.on('OrderFilled', async (
-        orderHash,
-        maker,
-        taker,
-        makerAssetId,
-        takerAssetId,
-        makerAmountFilled,
-        takerAmountFilled,
-        side,
-        event
-    ) => {
-        try {
-            if (maker.toLowerCase() !== targetLower) return
+        provider.on('error', e => {
+            log(`⚠️  Polygon provider error: ${e.message}`)
+        })
 
-            // Decode amounts (USDC = 6 decimals, shares = 6 decimals on Polygon)
-            const makerAmt  = Number(makerAmountFilled) / 1e6
-            const takerAmt  = Number(takerAmountFilled) / 1e6
+        // ── Attach contract event listener ─────────────────────────
+        const contract    = new ethers.Contract(CONFIG.EXCHANGE_ADDR, CTF_ABI, provider)
+        const targetLower = CONFIG.TARGET_WALLET.toLowerCase()
 
-            // side: 0 = BUY (maker is buying), 1 = SELL (maker is selling)
-            const isBuy = Number(side) === 0
+        contract.on('OrderFilled', async (
+            orderHash,
+            maker,
+            taker,
+            makerAssetId,
+            takerAssetId,
+            makerAmountFilled,
+            takerAmountFilled,
+            side,
+            event
+        ) => {
+            try {
+                if (maker.toLowerCase() !== targetLower) return
 
-            // If 0x8dxd is SELLING, we skip — we only copy their BUYS (new positions)
-            if (!isBuy) {
-                log(`  📤 0x8dxd SELL detected — not copying exits`)
-                return
+                const makerAmt  = Number(makerAmountFilled) / 1e6
+                const takerAmt  = Number(takerAmountFilled) / 1e6
+                const isBuy     = Number(side) === 0
+
+                if (!isBuy) {
+                    log(`  📤 0x8dxd SELL detected — not copying exits`)
+                    return
+                }
+
+                const detectedPrice = takerAmt > 0 ? makerAmt / takerAmt : 0
+                const tokenId       = makerAssetId.toString()
+
+                log(`\n  🔔 0x8dxd ON-CHAIN BUY detected!`)
+                log(`     TokenId : ${tokenId.slice(0, 20)}...`)
+                log(`     USDC    : $${makerAmt.toFixed(4)}  |  Shares: ${takerAmt.toFixed(4)}  |  Price: ${(detectedPrice*100).toFixed(2)}¢`)
+                log(`     TxHash  : ${event.log?.transactionHash?.slice(0, 18)}...`)
+
+                copyTrade(tokenId, detectedPrice, makerAmt).catch(e =>
+                    log(`  ⚠️  copyTrade error: ${e.message}`)
+                )
+            } catch (e) {
+                log(`  ⚠️  Event parse error: ${e.message}`)
             }
+        })
 
-            // makerAssetId = USDC token (when buying shares), takerAssetId = outcome token
-            // price ≈ makerAmt / takerAmt  (USDC spent / shares received)
-            const detectedPrice = takerAmt > 0 ? makerAmt / takerAmt : 0
-            const tokenId       = makerAssetId.toString()
+        log(`✅ Listening for OrderFilled from ${CONFIG.TARGET_WALLET}`)
+        log(`   Exchange: ${CONFIG.EXCHANGE_ADDR}`)
 
-            log(`\n  🔔 0x8dxd ON-CHAIN BUY detected!`)
-            log(`     TokenId : ${tokenId.slice(0, 20)}...`)
-            log(`     USDC    : $${makerAmt.toFixed(4)}  |  Shares: ${takerAmt.toFixed(4)}  |  Price: ${(detectedPrice*100).toFixed(2)}¢`)
-            log(`     TxHash  : ${event.log?.transactionHash?.slice(0, 18)}...`)
+    } catch (e) {
+        log(`❌ Polygon WS connect failed: ${e.message}`)
+        scheduleReconnect()
+    }
+}
 
-            // Copy the trade (non-blocking)
-            copyTrade(tokenId, detectedPrice, makerAmt).catch(e =>
-                log(`  ⚠️  copyTrade error: ${e.message}`)
-            )
-        } catch (e) {
-            log(`  ⚠️  Event parse error: ${e.message}`)
-        }
-    })
+function scheduleReconnect() {
+    wsRetryCount++
+    const delay = Math.min(5_000 * wsRetryCount, WS_MAX_RETRY_DELAY)
+    log(`🔄 Reconnecting in ${delay / 1000}s (attempt ${wsRetryCount})...`)
 
-    log(`✅ Listening for OrderFilled events from ${CONFIG.TARGET_WALLET}`)
-    log(`   Exchange: ${CONFIG.EXCHANGE_ADDR}`)
+    // Destroy old provider if it exists
+    try { if (provider) provider.destroy() } catch (_) {}
+    provider = null
+
+    setTimeout(() => {
+        connectPolygon().catch(e => log(`⚠️  Reconnect error: ${e.message}`))
+    }, delay)
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -534,8 +564,8 @@ async function main() {
     console.log(`  Min time left : ${CONFIG.MIN_TIME_LEFT_MS/1000}s — don't copy stale markets`)
     console.log(`  Log file      : copytrade_trades.json\n`)
 
-    // ① Connect to Polygon
-    connectPolygon()
+    // ① Connect to Polygon (async — retries on failure, never crashes process)
+    await connectPolygon()
 
     // ② Position monitor loop
     log('\n  Bot live — waiting for 0x8dxd trades on-chain...\n')
