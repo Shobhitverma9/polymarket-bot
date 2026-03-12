@@ -7,6 +7,8 @@
     "backtest": "node backtest.js",
     "montecarlo": "node montecarlo.js",
     "paperbot": "node paperbot.js",
+    "updown": "node updown_bot.js",
+    "copytrade": "node copytrade_bot.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
