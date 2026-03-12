@@ -59,8 +59,11 @@ const CONFIG = {
     TAKER_FEE:     0.018,
 
     // ── On-chain ─────────────────────────────────────────────────
-    // Polymarket CTF Exchange on Polygon
-    EXCHANGE_ADDR: '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e',
+    // Polymarket has TWO exchange contracts on Polygon — listen on both!
+    // Regular CTF Exchange (binary markets)
+    EXCHANGE_CTF:      '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e',
+    // Neg Risk CTF Exchange — used for Up/Down, hourly, 5-min markets
+    EXCHANGE_NEGRISK:  '0xC5d563A36AE78145C45a50134d48A1215220f80a',
 
     LOG_FILE: path.join(__dirname, 'copytrade_trades.json'),
 }
@@ -439,41 +442,82 @@ async function connectPolygon() {
         })
         wsProvider.on('error', e => log(`⚠️  WS provider error: ${e.message}`))
 
-        // ── Listen for OrderFilled ────────────────────────────────
-        const contract    = new ethers.Contract(CONFIG.EXCHANGE_ADDR, iface, wsProvider)
+        // ── Listen on BOTH Polymarket exchange contracts ──────────
         const targetLower = CONFIG.TARGET_WALLET.toLowerCase()
 
-        contract.on('OrderFilled', async (
-            orderHash, maker, taker,
-            makerAssetId, takerAssetId,
-            makerAmountFilled, takerAmountFilled,
-            side, event
-        ) => {
-            try {
-                if (maker.toLowerCase() !== targetLower) return
+        function attachListener(exchangeAddr, label) {
+            const contract = new ethers.Contract(exchangeAddr, iface, wsProvider)
 
-                const isBuy = Number(side) === 0
-                if (!isBuy) { log(`  📤 0x8dxd SELL — skip`); return }
+            contract.on('OrderFilled', async (
+                orderHash, maker, taker,
+                makerAssetId, takerAssetId,
+                makerAmountFilled, takerAmountFilled,
+                side, event
+            ) => {
+                try {
+                    const isMaker = maker.toLowerCase() === targetLower
+                    const isTaker = taker.toLowerCase() === targetLower
 
-                const makerAmt      = Number(makerAmountFilled) / 1e6
-                const takerAmt      = Number(takerAmountFilled) / 1e6
-                const detectedPrice = takerAmt > 0 ? makerAmt / takerAmt : 0
-                const tokenId       = makerAssetId.toString()
+                    // Skip if neither maker nor taker is our target
+                    if (!isMaker && !isTaker) return
 
-                log(`\n  🔔 0x8dxd ON-CHAIN BUY!`)
-                log(`     TokenId : ${tokenId.slice(0, 22)}...`)
-                log(`     USDC: $${makerAmt.toFixed(3)} | Shares: ${takerAmt.toFixed(3)} | Price: ${(detectedPrice*100).toFixed(2)}¢`)
-                log(`     TxHash  : ${event.log?.transactionHash?.slice(0, 20)}...`)
+                    totalDetected++
 
-                copyTrade(tokenId, detectedPrice, makerAmt).catch(e =>
-                    log(`  ⚠️  copyTrade error: ${e.message}`)
-                )
-            } catch (e) {
-                log(`  ⚠️  Event parse error: ${e.message}`)
-            }
-        })
+                    const sideNum = Number(side)
+                    // side=0 → maker is BUYING (pays USDC, gets shares)
+                    // side=1 → maker is SELLING (pays shares, gets USDC)
 
-        log(`✅ Listening for OrderFilled from ${CONFIG.TARGET_WALLET}`)
+                    let usdcSpent, sharesReceived, tokenId, isTargetBuying
+
+                    if (isMaker) {
+                        // 0x8dxd placed a LIMIT order
+                        if (sideNum !== 0) {
+                            log(`  📤 0x8dxd MAKER SELL [${label}] — skip`)
+                            return
+                        }
+                        // maker BUY: makerAsset=USDC, takerAsset=outcome token
+                        usdcSpent     = Number(makerAmountFilled) / 1e6
+                        sharesReceived = Number(takerAmountFilled) / 1e6
+                        tokenId       = takerAssetId.toString()
+                        isTargetBuying = true
+                    } else {
+                        // 0x8dxd is the TAKER (market order / fills someone's limit)
+                        if (sideNum !== 1) {
+                            // maker is BUYing (side=0) → taker is SELLING → skip
+                            log(`  📤 0x8dxd TAKER SELL [${label}] — skip`)
+                            return
+                        }
+                        // maker SELL (side=1): makerAsset=outcome token, takerAsset=USDC
+                        // taker (0x8dxd) pays takerAmountFilled USDC, gets makerAmountFilled shares
+                        usdcSpent      = Number(takerAmountFilled) / 1e6
+                        sharesReceived = Number(makerAmountFilled) / 1e6
+                        tokenId        = makerAssetId.toString()
+                        isTargetBuying = true
+                    }
+
+                    const detectedPrice = sharesReceived > 0 ? usdcSpent / sharesReceived : 0
+                    const role = isMaker ? 'MAKER' : 'TAKER'
+
+                    log(`\n  🔔 0x8dxd BUY [${label} / ${role}]`)
+                    log(`     TokenId : ${tokenId.slice(0, 22)}...`)
+                    log(`     USDC: $${usdcSpent.toFixed(3)} | Shares: ${sharesReceived.toFixed(3)} | Price: ${(detectedPrice*100).toFixed(2)}¢`)
+                    log(`     TxHash  : ${event.log?.transactionHash?.slice(0, 20)}...`)
+
+                    copyTrade(tokenId, detectedPrice, usdcSpent).catch(e =>
+                        log(`  ⚠️  copyTrade error: ${e.message}`)
+                    )
+                } catch (e) {
+                    log(`  ⚠️  Event parse error [${label}]: ${e.message}`)
+                }
+            })
+
+            log(`   ✅ [${label}] Watching ${exchangeAddr}`)
+        }
+
+        attachListener(CONFIG.EXCHANGE_CTF,     'CTF')
+        attachListener(CONFIG.EXCHANGE_NEGRISK, 'NegRisk')
+
+        log(`✅ Both exchanges subscribed — waiting for ${CONFIG.TARGET_WALLET} trades`)
 
     } catch (e) {
         log(`❌ WS connect failed: ${e.message}`)
