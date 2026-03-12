@@ -381,14 +381,12 @@ function saveTrades() {
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  ⑨ ON-CHAIN LISTENER — raw axios JSON-RPC polling
-//  Uses plain HTTPS POST to eth_blockNumber + eth_getLogs.
-//  No ethers.js provider needed — works on Render with any URL.
+//  ⑨ ON-CHAIN LISTENER — Polygon WebSocket (lowest latency ~1-2s)
+//  Requires RPC env var set to: wss://polygon-mainnet.g.alchemy.com/v2/<key>
+//  On Render: add RPC to Environment Variables in the Render dashboard.
 // ─────────────────────────────────────────────────────────────────
 
-const POLL_MS = 4_000  // poll every 4 seconds
-
-// ABI interface for log decoding (ethers Interface — no provider needed)
+// ABI + event topic for OrderFilled
 const iface = new ethers.Interface([
     `event OrderFilled(
         bytes32 indexed orderHash,
@@ -403,143 +401,95 @@ const iface = new ethers.Interface([
 ])
 const EVENT_TOPIC = iface.getEvent('OrderFilled').topicHash
 
-// Build a valid HTTPS RPC URL from whatever format is in the env
-function buildHttpRpcUrl() {
+let wsProvider   = null
+let wsRetries    = 0
+
+function getRpcUrl() {
     const raw = (process.env.RPC || '').trim()
-
     if (!raw) {
-        // Fallback to public Polygon RPC if env not set
-        log('⚠️  RPC env var not set — falling back to public Polygon RPC (slower)')
-        return 'https://polygon-rpc.com'
+        log('❌ FATAL: RPC env var is not set!')
+        log('   On Render: go to Environment → add RPC=wss://polygon-mainnet.g.alchemy.com/v2/<your-key>')
+        log('   Locally: add RPC=wss://... to your .env file')
+        process.exit(1)
     }
-
-    // Convert wss:// or ws:// to https:// / http://
+    log(`   RPC URL: ${raw.slice(0, 55)}...`)
     return raw
-        .replace(/^wss:\/\//i, 'https://')
-        .replace(/^ws:\/\//i,  'http://')
 }
 
-const RPC_URL = buildHttpRpcUrl()
-let lastBlock    = 0
-let pollRunning  = false
-let pollErrors   = 0
-
-// Raw JSON-RPC call via axios — no ethers provider dependency
-async function rpcCall(method, params = []) {
-    const r = await axios.post(RPC_URL, {
-        jsonrpc: '2.0',
-        id:      1,
-        method,
-        params,
-    }, { timeout: 8000 })
-
-    if (r.data.error) throw new Error(`RPC error: ${JSON.stringify(r.data.error)}`)
-    return r.data.result
-}
-
-async function startPollingListener() {
-    log(`🔌 Connecting via JSON-RPC: ${RPC_URL.slice(0, 60)}...`)
+async function connectPolygon() {
+    const rpcUrl = getRpcUrl()
+    log('🔌 Connecting to Polygon WebSocket...')
 
     try {
-        const blockHex  = await rpcCall('eth_blockNumber')
-        lastBlock = parseInt(blockHex, 16) - 2  // start 2 blocks back
-        pollErrors = 0
-        log(`✅ JSON-RPC connected. Current block: ${lastBlock + 2}`)
-        log(`   Polling every ${POLL_MS / 1000}s | Event: ${EVENT_TOPIC.slice(0, 20)}...`)
-        log(`   Watching: ${CONFIG.TARGET_WALLET}`)
-    } catch (e) {
-        log(`❌ JSON-RPC connect failed: ${e.message}`)
-        log(`   URL used: ${RPC_URL}`)
-        log(`   Retrying in 15s...`)
-        setTimeout(startPollingListener, 15_000)
-        return
-    }
+        wsProvider = new ethers.WebSocketProvider(rpcUrl)
 
-    pollRunning = true
-    pollLogs()
+        // Wait up to 8s for socket to open — catch immediate failures
+        await new Promise((resolve, reject) => {
+            const t = setTimeout(() => resolve(), 8000)
+            wsProvider.websocket.on('open',  ()  => { clearTimeout(t); resolve() })
+            wsProvider.websocket.on('error', (e) => { clearTimeout(t); reject(e) })
+        })
+
+        wsRetries = 0
+        log('✅ Polygon WebSocket connected')
+
+        wsProvider.websocket.on('close', code => {
+            log(`⚠️  WS closed (${code}) — reconnecting...`)
+            _scheduleWsReconnect()
+        })
+        wsProvider.on('error', e => log(`⚠️  WS provider error: ${e.message}`))
+
+        // ── Listen for OrderFilled ────────────────────────────────
+        const contract    = new ethers.Contract(CONFIG.EXCHANGE_ADDR, iface, wsProvider)
+        const targetLower = CONFIG.TARGET_WALLET.toLowerCase()
+
+        contract.on('OrderFilled', async (
+            orderHash, maker, taker,
+            makerAssetId, takerAssetId,
+            makerAmountFilled, takerAmountFilled,
+            side, event
+        ) => {
+            try {
+                if (maker.toLowerCase() !== targetLower) return
+
+                const isBuy = Number(side) === 0
+                if (!isBuy) { log(`  📤 0x8dxd SELL — skip`); return }
+
+                const makerAmt      = Number(makerAmountFilled) / 1e6
+                const takerAmt      = Number(takerAmountFilled) / 1e6
+                const detectedPrice = takerAmt > 0 ? makerAmt / takerAmt : 0
+                const tokenId       = makerAssetId.toString()
+
+                log(`\n  🔔 0x8dxd ON-CHAIN BUY!`)
+                log(`     TokenId : ${tokenId.slice(0, 22)}...`)
+                log(`     USDC: $${makerAmt.toFixed(3)} | Shares: ${takerAmt.toFixed(3)} | Price: ${(detectedPrice*100).toFixed(2)}¢`)
+                log(`     TxHash  : ${event.log?.transactionHash?.slice(0, 20)}...`)
+
+                copyTrade(tokenId, detectedPrice, makerAmt).catch(e =>
+                    log(`  ⚠️  copyTrade error: ${e.message}`)
+                )
+            } catch (e) {
+                log(`  ⚠️  Event parse error: ${e.message}`)
+            }
+        })
+
+        log(`✅ Listening for OrderFilled from ${CONFIG.TARGET_WALLET}`)
+
+    } catch (e) {
+        log(`❌ WS connect failed: ${e.message}`)
+        _scheduleWsReconnect()
+    }
 }
 
-async function pollLogs() {
-    if (!pollRunning) return
-
-    try {
-        const blockHex   = await rpcCall('eth_blockNumber')
-        const latestBlock = parseInt(blockHex, 16)
-
-        if (latestBlock > lastBlock) {
-            const fromBlock = lastBlock + 1
-            const toBlock   = latestBlock
-
-            // eth_getLogs — filter by contract + event topic
-            const logs = await rpcCall('eth_getLogs', [{
-                address:   CONFIG.EXCHANGE_ADDR,
-                topics:    [EVENT_TOPIC],
-                fromBlock: '0x' + fromBlock.toString(16),
-                toBlock:   '0x' + toBlock.toString(16),
-            }])
-
-            if (logs.length > 0) {
-                log(`  🔍 Blocks ${fromBlock}-${toBlock}: ${logs.length} OrderFilled event(s)`)
-            }
-
-            for (const rawLog of logs) {
-                try {
-                    const parsed = iface.parseLog({
-                        topics: rawLog.topics,
-                        data:   rawLog.data,
-                    })
-                    if (!parsed) continue
-
-                    const maker = parsed.args[1]
-                    if (maker.toLowerCase() !== CONFIG.TARGET_WALLET.toLowerCase()) continue
-
-                    const makerAssetId      = parsed.args[3]
-                    const makerAmountFilled = parsed.args[5]
-                    const takerAmountFilled = parsed.args[6]
-                    const side              = Number(parsed.args[7])
-                    const isBuy             = side === 0
-
-                    if (!isBuy) {
-                        log(`  📤 0x8dxd SELL (block ${parseInt(rawLog.blockNumber, 16)}) — skip`)
-                        continue
-                    }
-
-                    const makerAmt      = Number(makerAmountFilled) / 1e6
-                    const takerAmt      = Number(takerAmountFilled) / 1e6
-                    const detectedPrice = takerAmt > 0 ? makerAmt / takerAmt : 0
-                    const tokenId       = makerAssetId.toString()
-
-                    log(`\n  🔔 0x8dxd ON-CHAIN BUY (block ${parseInt(rawLog.blockNumber, 16)})`)
-                    log(`     TokenId : ${tokenId.slice(0, 20)}...`)
-                    log(`     USDC    : $${makerAmt.toFixed(4)}  |  Shares: ${takerAmt.toFixed(4)}  |  Price: ${(detectedPrice*100).toFixed(2)}¢`)
-                    log(`     TxHash  : ${rawLog.transactionHash?.slice(0, 18)}...`)
-
-                    copyTrade(tokenId, detectedPrice, makerAmt).catch(e =>
-                        log(`  ⚠️  copyTrade error: ${e.message}`)
-                    )
-                } catch (parseErr) {
-                    log(`  ⚠️  Log parse error: ${parseErr.message}`)
-                }
-            }
-
-            lastBlock  = toBlock
-            pollErrors = 0   // successful poll — reset error count
-        }
-    } catch (e) {
-        pollErrors++
-        log(`  ⚠️  Poll error #${pollErrors}: ${e.message}`)
-
-        // After 5 consecutive errors, restart listener
-        if (pollErrors >= 5) {
-            pollRunning = false
-            log('  🔄 Too many errors — restarting listener in 20s...')
-            setTimeout(startPollingListener, 20_000)
-            return
-        }
-    }
-
-    setTimeout(pollLogs, POLL_MS)
+function _scheduleWsReconnect() {
+    wsRetries++
+    const delay = Math.min(5_000 * wsRetries, 60_000)
+    log(`🔄 Reconnect attempt ${wsRetries} in ${delay / 1000}s`)
+    try { if (wsProvider) wsProvider.destroy() } catch (_) {}
+    wsProvider = null
+    setTimeout(() => connectPolygon().catch(e => log(`⚠️  Reconnect err: ${e.message}`)), delay)
 }
+
 
 // ─────────────────────────────────────────────────────────────────
 //  ⑩ GRACEFUL SHUTDOWN
@@ -586,8 +536,8 @@ async function main() {
     console.log(`  Min time left : ${CONFIG.MIN_TIME_LEFT_MS/1000}s — don't copy stale markets`)
     console.log(`  Log file      : copytrade_trades.json\n`)
 
-    // ① Start HTTP eth_getLogs polling listener (Render-compatible, no WebSocket)
-    await startPollingListener()
+    // ① Connect to Polygon WebSocket (lowest latency, ~1-2s)
+    await connectPolygon()
 
     // ② Position monitor loop
     log('\n  Bot live — waiting for 0x8dxd trades on-chain...\n')
