@@ -2,4 +2,10 @@ node_modules/
 .env
 paper_trades.json
 montecarlo_output.txt
+copytrade_v2_history.json
+copytrade_trades.json
+test_*.js
+verify_bot.js
+introspect_client.js
 .DS_Store
+

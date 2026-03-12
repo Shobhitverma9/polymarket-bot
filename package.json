@@ -9,6 +9,8 @@
     "paperbot": "node paperbot.js",
     "updown": "node updown_bot.js",
     "copytrade": "node copytrade_bot.js",
+    "arb-backtest": "node arb_backtest.js",
+    "arb-bot": "node arb_bot.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -16,6 +18,7 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "@polymarket/clob-client": "^5.8.0",
     "axios": "^1.13.6",
     "dotenv": "^17.3.1",
     "ethers": "^6.16.0",
