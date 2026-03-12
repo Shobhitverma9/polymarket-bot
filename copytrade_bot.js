@@ -381,19 +381,14 @@ function saveTrades() {
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  ⑨ ON-CHAIN LISTENER — HTTP eth_getLogs polling (Render-compatible)
-//  WebSockets are blocked on Render. We use a JsonRpcProvider over
-//  HTTPS and poll eth_getLogs every POLL_MS. Latency ~3-6s vs 1-2s
-//  for WS — still 5-12× faster than the REST activity API (7-37s).
+//  ⑨ ON-CHAIN LISTENER — raw axios JSON-RPC polling
+//  Uses plain HTTPS POST to eth_blockNumber + eth_getLogs.
+//  No ethers.js provider needed — works on Render with any URL.
 // ─────────────────────────────────────────────────────────────────
 
-const POLL_MS = 4_000   // poll every 4 seconds
+const POLL_MS = 4_000  // poll every 4 seconds
 
-// OrderFilled event topic0 (keccak256 of the signature)
-// keccak256("OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint8)")
-const ORDER_FILLED_TOPIC = '0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06c0b1a3e7601234c4a3b5d9e'
-
-// We compute it dynamically to be safe
+// ABI interface for log decoding (ethers Interface — no provider needed)
 const iface = new ethers.Interface([
     `event OrderFilled(
         bytes32 indexed orderHash,
@@ -408,37 +403,58 @@ const iface = new ethers.Interface([
 ])
 const EVENT_TOPIC = iface.getEvent('OrderFilled').topicHash
 
-// Convert wss:// → https:// so we can use plain HTTPS on Render
-function rpcHttpUrl() {
-    return (process.env.RPC || '')
-        .replace(/^wss:\/\//, 'https://')
-        .replace(/^ws:\/\//, 'http://')
+// Build a valid HTTPS RPC URL from whatever format is in the env
+function buildHttpRpcUrl() {
+    const raw = (process.env.RPC || '').trim()
+
+    if (!raw) {
+        // Fallback to public Polygon RPC if env not set
+        log('⚠️  RPC env var not set — falling back to public Polygon RPC (slower)')
+        return 'https://polygon-rpc.com'
+    }
+
+    // Convert wss:// or ws:// to https:// / http://
+    return raw
+        .replace(/^wss:\/\//i, 'https://')
+        .replace(/^ws:\/\//i,  'http://')
 }
 
-let httpProvider  = null
-let lastBlock     = 0
-let pollRunning   = false
+const RPC_URL = buildHttpRpcUrl()
+let lastBlock    = 0
+let pollRunning  = false
+let pollErrors   = 0
+
+// Raw JSON-RPC call via axios — no ethers provider dependency
+async function rpcCall(method, params = []) {
+    const r = await axios.post(RPC_URL, {
+        jsonrpc: '2.0',
+        id:      1,
+        method,
+        params,
+    }, { timeout: 8000 })
+
+    if (r.data.error) throw new Error(`RPC error: ${JSON.stringify(r.data.error)}`)
+    return r.data.result
+}
 
 async function startPollingListener() {
-    const url = rpcHttpUrl()
-    log(`🔌 Connecting via HTTP JSON-RPC: ${url.slice(0, 50)}...`)
+    log(`🔌 Connecting via JSON-RPC: ${RPC_URL.slice(0, 60)}...`)
 
     try {
-        httpProvider = new ethers.JsonRpcProvider(url)
-        // Verify connection
-        const currentBlock = await httpProvider.getBlockNumber()
-        lastBlock = currentBlock - 2   // start 2 blocks back so we don't miss anything
-        log(`✅ HTTP provider connected. Current block: ${currentBlock}`)
-        log(`   Polling every ${POLL_MS / 1000}s for OrderFilled from ${CONFIG.TARGET_WALLET}`)
-        log(`   Event topic: ${EVENT_TOPIC.slice(0, 20)}...`)
+        const blockHex  = await rpcCall('eth_blockNumber')
+        lastBlock = parseInt(blockHex, 16) - 2  // start 2 blocks back
+        pollErrors = 0
+        log(`✅ JSON-RPC connected. Current block: ${lastBlock + 2}`)
+        log(`   Polling every ${POLL_MS / 1000}s | Event: ${EVENT_TOPIC.slice(0, 20)}...`)
+        log(`   Watching: ${CONFIG.TARGET_WALLET}`)
     } catch (e) {
-        log(`❌ HTTP provider connect failed: ${e.message}`)
+        log(`❌ JSON-RPC connect failed: ${e.message}`)
+        log(`   URL used: ${RPC_URL}`)
         log(`   Retrying in 15s...`)
         setTimeout(startPollingListener, 15_000)
         return
     }
 
-    // Start poll loop
     pollRunning = true
     pollLogs()
 }
@@ -447,19 +463,20 @@ async function pollLogs() {
     if (!pollRunning) return
 
     try {
-        const latestBlock = await httpProvider.getBlockNumber()
+        const blockHex   = await rpcCall('eth_blockNumber')
+        const latestBlock = parseInt(blockHex, 16)
 
         if (latestBlock > lastBlock) {
             const fromBlock = lastBlock + 1
             const toBlock   = latestBlock
 
-            // eth_getLogs for OrderFilled on the exchange contract
-            const logs = await httpProvider.getLogs({
+            // eth_getLogs — filter by contract + event topic
+            const logs = await rpcCall('eth_getLogs', [{
                 address:   CONFIG.EXCHANGE_ADDR,
                 topics:    [EVENT_TOPIC],
-                fromBlock,
-                toBlock,
-            })
+                fromBlock: '0x' + fromBlock.toString(16),
+                toBlock:   '0x' + toBlock.toString(16),
+            }])
 
             if (logs.length > 0) {
                 log(`  🔍 Blocks ${fromBlock}-${toBlock}: ${logs.length} OrderFilled event(s)`)
@@ -467,20 +484,23 @@ async function pollLogs() {
 
             for (const rawLog of logs) {
                 try {
-                    const parsed = iface.parseLog(rawLog)
+                    const parsed = iface.parseLog({
+                        topics: rawLog.topics,
+                        data:   rawLog.data,
+                    })
                     if (!parsed) continue
 
-                    const maker = parsed.args[1]   // maker address
+                    const maker = parsed.args[1]
                     if (maker.toLowerCase() !== CONFIG.TARGET_WALLET.toLowerCase()) continue
 
-                    const makerAssetId       = parsed.args[3]
-                    const makerAmountFilled  = parsed.args[5]
-                    const takerAmountFilled  = parsed.args[6]
-                    const side               = Number(parsed.args[7])
-                    const isBuy              = side === 0
+                    const makerAssetId      = parsed.args[3]
+                    const makerAmountFilled = parsed.args[5]
+                    const takerAmountFilled = parsed.args[6]
+                    const side              = Number(parsed.args[7])
+                    const isBuy             = side === 0
 
                     if (!isBuy) {
-                        log(`  📤 0x8dxd SELL detected (block ${rawLog.blockNumber}) — skipping`)
+                        log(`  📤 0x8dxd SELL (block ${parseInt(rawLog.blockNumber, 16)}) — skip`)
                         continue
                     }
 
@@ -489,7 +509,7 @@ async function pollLogs() {
                     const detectedPrice = takerAmt > 0 ? makerAmt / takerAmt : 0
                     const tokenId       = makerAssetId.toString()
 
-                    log(`\n  🔔 0x8dxd ON-CHAIN BUY (block ${rawLog.blockNumber})`)
+                    log(`\n  🔔 0x8dxd ON-CHAIN BUY (block ${parseInt(rawLog.blockNumber, 16)})`)
                     log(`     TokenId : ${tokenId.slice(0, 20)}...`)
                     log(`     USDC    : $${makerAmt.toFixed(4)}  |  Shares: ${takerAmt.toFixed(4)}  |  Price: ${(detectedPrice*100).toFixed(2)}¢`)
                     log(`     TxHash  : ${rawLog.transactionHash?.slice(0, 18)}...`)
@@ -502,20 +522,22 @@ async function pollLogs() {
                 }
             }
 
-            lastBlock = toBlock
+            lastBlock  = toBlock
+            pollErrors = 0   // successful poll — reset error count
         }
     } catch (e) {
-        log(`  ⚠️  Poll error: ${e.message} — will retry`)
-        // If provider is broken, recreate it
-        if (e.message?.includes('network') || e.message?.includes('connect')) {
+        pollErrors++
+        log(`  ⚠️  Poll error #${pollErrors}: ${e.message}`)
+
+        // After 5 consecutive errors, restart listener
+        if (pollErrors >= 5) {
             pollRunning = false
-            log('  🔄 Recreating HTTP provider in 10s...')
-            setTimeout(startPollingListener, 10_000)
+            log('  🔄 Too many errors — restarting listener in 20s...')
+            setTimeout(startPollingListener, 20_000)
             return
         }
     }
 
-    // Schedule next poll
     setTimeout(pollLogs, POLL_MS)
 }
 
